@@ -768,8 +768,14 @@ async function fetchWithTimeout(url, options, timeoutMs = 3500, _retried = false
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(viaTransitous ? transitousUrl(url) : viaOpendata ? opendataUrl(url) : url, {...options, signal: controller.signal});
-    if (viaOpendata && (res.status === 429 || res.status === 503)) opendataPauseUntil = Date.now() + 600000; // refused (or proxy paused): stop asking for 10 min
-    if (res.status === 429) { rateLimitedUntil = Date.now() + 600000; transitousPauseUntil = Date.now() + 600000; }
+    // A 429 from OUR proxy only means its own request budget for this minute is used up (a burst of cache
+    // misses, e.g. right after a page reload) — never that Transitous refused us (the proxy turns that into
+    // 503). Wait the time the proxy names (default 45 s), not 10 minutes. 503/403 stay long pauses.
+    const proxyWait = () => Math.min(Math.max((Number(res.headers.get('Retry-After')) || 45) * 1000, 20000), 600000);
+    if (viaOpendata && res.status === 429 && OPENDATA_PROXY_BASE) opendataPauseUntil = Date.now() + proxyWait();
+    else if (viaOpendata && (res.status === 429 || res.status === 503)) opendataPauseUntil = Date.now() + 600000; // refused (or proxy paused): stop asking for 10 min
+    if (res.status === 429 && viaTransitous && TRANSITOUS_PROXY_BASE) { const w = proxyWait(); rateLimitedUntil = Date.now() + w; transitousPauseUntil = Date.now() + w; }
+    else if (res.status === 429) { rateLimitedUntil = Date.now() + 600000; transitousPauseUntil = Date.now() + 600000; }
     if (res.status === 503 && viaTransitous) transitousPauseUntil = Date.now() + 600000; // the proxy says: Transitous refused / is paused
     if (res.status === 403 && viaTransitous) transitousPauseUntil = Date.now() + 3600000;
     if (viaTransitous && res.ok) transitousFailStreak = 0;
@@ -1800,7 +1806,9 @@ function statusInfo(t) {
         : (t.delaySource === 'scotty' && t._rerouted) ? 'Umleitung (ÖBB-Prognose)' : undefined,
     };
   }
-  if (notYetDeparted) {
+  if (notYetDeparted || (t.dep && !depTrusted(t))) {
+    // dep not yet confirmed as the true origin departure: still shown (a bare "Keine Daten vorhanden" reads as
+    // "no prognosis will ever come"); the route resolver replaces it with the real time within a few polls.
     return {cls: 's-unknown', label: `Abfahrt ${t.dep} Uhr`};
   }
   return {cls: 's-unknown', label: 'Keine Daten vorhanden'};
