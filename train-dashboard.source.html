@@ -714,6 +714,11 @@ const COUPLED_NUMBER_PAIRS = [['NJ', '459', '409'], ['NJ', '458', '408'],
   // 22.11.2026: SBB labels the Swiss part of the (re-timed) Budapest–Zürich night train "NJ 436"; ÖBB/MÁV
   // keep calling it 466. The Swiss number is shown, the curated 466 row steps aside.
   ['NJ', '436', '466'], ['NJ', '434', '464']]; // 434/464: same pattern, seen 22.11.2026 (Buchs SG 09:36 listed twice)
+// 436/466 and 434/464 are ALTERNATE numbers of one train: all four are known in Switzerland and, depending on
+// construction works / running day, the train runs under the one or the other, never under both (user, 23.11.2026).
+// So no fixed "Swiss" number: a lone row keeps its own number; if both numbers show up at the same time, the one
+// the Swiss feed runs today is kept. (459/409 and 458/408 are different: there the Swiss number always wins.)
+const isAlternatePair = ([, swiss, other]) => ['436|466', '434|464'].includes(swiss + '|' + other);
 // Operating days of curated rows that do NOT run every day (JS weekday: 0 = Sunday … 6 = Saturday).
 // On the other days the row is hidden — it would only show "Keine Daten". Where the train runs under
 // another number on the excluded days (EC 44 → EC 144 on Sundays), that row comes from the live boards.
@@ -732,8 +737,16 @@ function runsOnDisplayedDay(t) {
 const HIDE_WITHOUT_REALTIME = new Set(['NJ 466']);
 // Number under which ÖBB's Scotty knows a train that SBB labels differently.
 const SCOTTY_NUMBER_ALIAS = {'NJ 436': 'NJ 466', 'NJ 434': 'NJ 464'};
+// Shown number: always the Swiss one (NJ 408 -> 458, 409 -> 459, 464 -> 434, 466 -> 436), even while the Swiss row of
+// the same train is not on the board (then the row used to appear under the foreign number). Display only - the
+// internal id stays, because live rows are re-matched across polls by their number.
+function displayNumber(t) {
+  const id = t.type + ' ' + numKey(t.id);
+  for (const pair of COUPLED_NUMBER_PAIRS) if (!isAlternatePair(pair) && id === pair[0] + ' ' + pair[2]) return pair[1];
+  return t.id.replace(/^\S+\s/, '');
+}
 function canonicalRecordId(id) {
-  for (const [type, swiss, other] of COUPLED_NUMBER_PAIRS) if (id === type + ' ' + other) return type + ' ' + swiss;
+  for (const pair of COUPLED_NUMBER_PAIRS) if (!isAlternatePair(pair) && id === pair[0] + ' ' + pair[2]) return pair[0] + ' ' + pair[1];
   return id;
 }
 let rateLimitedUntil = 0;
@@ -1397,8 +1410,20 @@ function trainTargetDateKeyScheduled(train) {
 // actually running fine, well after its own confirmed cancellation had
 // happened on the previous occurrence). Run once per render pass, before
 // filtering/sorting.
+// A foreign-feed trip id starts with the date and the departure time at the trip's OWN first stop
+// ("20261122_20:52_de-DELFI_..." = Berlin 20:52 on 22.11.). When the board entry carried no scheduled departure of its
+// own the row's dep fell back to the border time ("Abfahrt 06:56" for a night train that left Prague the evening
+// before). The trip id gives the real origin time without any extra request.
+function adoptOwnTripDep(t) {
+  if (t._id < 100000 || t._depConfirmed || t._depTripId || !t.tripId || /ch-opentransportdataswiss/.test(t.tripId)) return;
+  const m = /^\d{8}_(\d{1,2}):(\d\d)_/.exec(t.tripId);
+  if (!m) return;
+  t.dep = String(parseInt(m[1], 10) % 24).padStart(2, '0') + ':' + m[2];
+  t._depTripId = true;
+}
 function resetStaleDayConfirmations() {
   for (const t of TRAINS) {
+    adoptOwnTripDep(t);
     if (t.delayKnown && t._confirmedDateKey && t._confirmedDateKey !== trainTargetDateKeyScheduled(t)) {
       t.delayKnown = false; t.status = 'on-time'; t.delay = 0; t.liveSeen = false; t._cancelLock = null;
     }
@@ -1494,7 +1519,7 @@ function applyFilters() {
     if (state.filters.direction === 'incoming' && !isArrivingFromAbroad(t)) return false;
     if (state.search) {
       const q = state.search.toLowerCase();
-      if (![t.id, t.from, t.to, t.chStation].some(s => s.toLowerCase().includes(q))) return false;
+      if (![t.id, t.type + ' ' + displayNumber(t), t.from, t.to, t.chStation].some(s => s.toLowerCase().includes(q))) return false;
     }
     return true;
   });
@@ -1660,7 +1685,7 @@ function renderTable() {
     // contradict each other again.
     const effStr = delayKnownDisplay && t.delay ? ` <span class="${dc}" style="font-size:11px">→${minToHHMM(effChMin(t))}</span>` : '';
     const sel = t._id === state.selectedId ? 'selected' : '';
-    const num = t.id.replace(/^\S+\s/,'');
+    const num = displayNumber(t);
     const zLabel = state.selectedId === t._id ? 'Zuglauf schliessen' : 'Zuglauf öffnen';
     const verifyHref = verifyLinkFor(t);
     const verifyIsDeRis = verifyHref === 'https://ris-info.bahn.de/';
@@ -1734,7 +1759,7 @@ function renderTable() {
 const SWISS_ORIGIN_RE = /^(Zürich|Bern|Genève|Lausanne|Luzern|Chur|Interlaken|Brig|Visp|Zug|St. ?Gallen|Winterthur|Biel|Neuchâtel|Olten|Lugano|Bellinzona|Locarno|Thun|Spiez|Fribourg|Sion|Montreux)/i;
 function depTrusted(t) {
   if (!t.dep) return false;
-  if (t._depConfirmed) return true;
+  if (t._depConfirmed || t._depTripId) return true;
   if (t._id < 100000) return SWISS_ORIGIN_RE.test(cleanStationName(t.from)) && circDiff(toMin(t.dep), toMin(t.chTime)) < 600; // hand-entered: only a Swiss origin is certain (IC 281 "Stuttgart 18:05" was Singen's time)
   if (!t._originCH) return false;
   return circDiff(toMin(t.dep), toMin(t.chTime)) < 600 && resolveEff({chTime: t.dep, delay: 0}, nowMin()) <= resolveEff(t, nowMin()) + 5;
@@ -1806,7 +1831,7 @@ function statusInfo(t) {
         : (t.delaySource === 'scotty' && t._rerouted) ? 'Umleitung (ÖBB-Prognose)' : undefined,
     };
   }
-  if (notYetDeparted || (t.dep && !depTrusted(t))) {
+  if (notYetDeparted || (t.dep && !depTrusted(t) && resolveEff({chTime: t.dep, delay: 0}, now) > now)) {
     // dep not yet confirmed as the true origin departure: still shown (a bare "Keine Daten vorhanden" reads as
     // "no prognosis will ever come"); the route resolver replaces it with the real time within a few polls.
     return {cls: 's-unknown', label: `Abfahrt ${t.dep} Uhr`};
@@ -1834,7 +1859,7 @@ function closeDetail() {
 }
 
 function zuglaufPanelHeader(t) {
-  const num = t.id.replace(/^\S+\s/, '');
+  const num = displayNumber(t);
   return `<div class="detail-train"><span class="type-badge badge-${t.type}">${t.type}</span> ${num}</div>
     <div class="detail-route">${t.from} → ${t.to}</div>`;
 }
@@ -3690,7 +3715,7 @@ function dedupeSameRunDuplicates() {
   // physical train (409 Berlin / 459 Praha, 408 Berlin / 458 Praha); the feeds
   // give both. The Swiss one (first of the pair) is shown, the other hidden —
   // but only when both are on the board at about the same time.
-  COUPLED_NUMBER_PAIRS.forEach(([type, swissNo, otherNo]) => {
+  COUPLED_NUMBER_PAIRS.filter(p => !isAlternatePair(p)).forEach(([type, swissNo, otherNo]) => {
     const swiss = TRAINS.filter(t => !t._hiddenDuplicate && t.type === type && numKey(t.id) === swissNo);
     TRAINS.filter(t => !t._hiddenDuplicate && t.type === type && numKey(t.id) === otherNo).forEach(o => {
       const mate = swiss.find(s => circDiff(toMin(s.chTime), toMin(o.chTime)) <= 90);
@@ -3702,9 +3727,40 @@ function dedupeSameRunDuplicates() {
       o._hiddenDuplicate = true; o._hiddenReason = 'merge';
     });
   });
+  // Alternate numbers (436/466, 434/464): only one of them runs. Both on the board at the same time = one train
+  // listed twice (Swiss feed under one number, ÖBB/MÁV under the other); the Swiss feed's number is the one in use.
+  COUPLED_NUMBER_PAIRS.filter(isAlternatePair).forEach(([type, noA, noB]) => {
+    const rowsOf = no => TRAINS.filter(t => !t._hiddenDuplicate && t.type === type && numKey(t.id) === no);
+    const isCh = t => /ch-opentransportdataswiss/.test(t.tripId || '');
+    rowsOf(noB).forEach(b => {
+      const a = rowsOf(noA).find(x => circDiff(toMin(x.chTime), toMin(b.chTime)) <= 90);
+      if (!a) return;
+      const keep = isCh(a) ? a : isCh(b) ? b : (b.delayKnown && !a.delayKnown ? b : a);
+      const drop = keep === a ? b : a;
+      if (drop.delayKnown && !keep.delayKnown) {
+        ['delay', 'status', 'delayKnown', 'delaySource'].forEach(k => { if (drop[k] !== undefined) keep[k] = drop[k]; });
+      }
+      extendRunFromLonger(keep, drop);
+      drop._hiddenDuplicate = true; drop._hiddenReason = 'merge';
+    });
+  });
+  // Real-time donor: the number families of one physical train (408/458, 409/459, 436/466, 434/464) are separate trips in
+  // the feeds, and the forecast often sits on only ONE of them (the Berlin section 408 has one, the Praha section 458 none,
+  // although it is the same train). Whichever of the rows is shown must carry the forecast of its twin — also when the twin
+  // is hidden or got its forecast after the merge above. Cancellations are never passed on (a section can be cut alone).
+  COUPLED_NUMBER_PAIRS.forEach(([type, noA, noB]) => {
+    const fam = TRAINS.filter(t => t.type === type && t.chTime && [noA, noB].includes(numKey(t.id)));
+    fam.filter(r => !r._hiddenDuplicate && (!r.delayKnown || r.delaySource === 'estimate')).forEach(r => {
+      const donor = fam.find(d => d !== r && d.delayKnown && d.delaySource !== 'estimate' && d.status !== 'cancelled'
+        && circDiff(toMin(d.chTime), toMin(r.chTime)) <= 90 && trainTargetDateKeyScheduled(d) === trainTargetDateKeyScheduled(r));
+      if (!donor) return;
+      ['delay', 'status', 'delayKnown', 'delaySource'].forEach(k => { if (donor[k] !== undefined) r[k] = donor[k]; });
+      r._confirmedDateKey = trainTargetDateKeyScheduled(r); r._estFrom = null;
+    });
+  });
   // The longer run may sit in a row an earlier pass already hid (the ÖBB/MÁV row of NJ 466 is hidden as
   // a twin of the curated 466) — still use its far end for the Swiss row (436 "Feldkirch" → Budapest).
-  COUPLED_NUMBER_PAIRS.forEach(([type, swissNo, otherNo]) => {
+  COUPLED_NUMBER_PAIRS.flatMap(p => isAlternatePair(p) ? [p, [p[0], p[2], p[1]]] : [p]).forEach(([type, swissNo, otherNo]) => {
     TRAINS.filter(t => !t._hiddenDuplicate && t.type === type && numKey(t.id) === swissNo).forEach(sw => {
       const o = TRAINS.find(x => x !== sw && x.type === type && numKey(x.id) === otherNo && x.tripId && !/ch-opentransportdataswiss/.test(x.tripId)
         && circDiff(toMin(sw.chTime), toMin(x.chTime)) <= 90);
