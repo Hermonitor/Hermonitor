@@ -1229,7 +1229,7 @@ const BASE_TRAINS = [
   {id:'EC 40',  from:'Milano Centrale',to:'Genève',          dep:'06:25', arr:'12:31', chTime:'09:48', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
   {id:'EC 42',  from:'Milano Centrale',to:'Genève',          dep:'13:10', arr:'15:31', chTime:'14:48', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
   {id:'EC 44',  from:'Milano Centrale',to:'Genève',          dep:'16:25', arr:'20:31', chTime:'18:48', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
-  {id:'EC 46',  from:'Milano Centrale',to:'Genève',          dep:'18:25', arr:'00:07', chTime:'20:48', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
+  {id:'EC 46',  from:'Venezia S.Lucia',to:'Genève',          dep:'16:18', arr:'00:07', chTime:'20:48', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
 
   {id:'EC 61',  from:'Basel SBB',      to:'Milano Centrale', dep:'06:30', arr:'13:35', chTime:'09:12', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
   {id:'EC 65',  from:'Basel SBB',      to:'Milano Centrale', dep:'12:30', arr:'19:35', chTime:'15:12', chStation:'Domodossola', type:'EC', region:'west', operator:'SBB/Trenitalia'},
@@ -1414,16 +1414,42 @@ function trainTargetDateKeyScheduled(train) {
 // ("20261122_20:52_de-DELFI_..." = Berlin 20:52 on 22.11.). When the board entry carried no scheduled departure of its
 // own the row's dep fell back to the border time ("Abfahrt 06:56" for a night train that left Prague the evening
 // before). The trip id gives the real origin time without any extra request.
+function tripPrefixDep(id) {
+  const m = /^\d{8}_(\d{1,2}):(\d\d)_/.exec(id || '');
+  return m ? String(parseInt(m[1], 10) % 24).padStart(2, '0') + ':' + m[2] : null;
+}
+// Also for a row whose OWN trip is the Swiss part (it starts at the border, dep = border time, e.g. NJ 458 "Abfahrt 07:21"):
+// the foreign trip kept in _foreignRouteTripId is the leg before it and carries the real origin time.
 function adoptOwnTripDep(t) {
-  if (t._id < 100000 || t._depConfirmed || t._depTripId || !t.tripId || /ch-opentransportdataswiss/.test(t.tripId)) return;
-  const m = /^\d{8}_(\d{1,2}):(\d\d)_/.exec(t.tripId);
-  if (!m) return;
-  t.dep = String(parseInt(m[1], 10) % 24).padStart(2, '0') + ':' + m[2];
-  t._depTripId = true;
+  if (t._id < 100000 || t._depConfirmed || t._depTripId) return;
+  const isCh = id => /ch-opentransportdataswiss/.test(id || '');
+  let d = null;
+  if (t.tripId && !isCh(t.tripId)) d = tripPrefixDep(t.tripId);
+  else if (t._foreignRouteTripId && !isCh(t._foreignRouteTripId) && t.dep && t.chTime && circDiff(toMin(t.dep), toMin(t.chTime)) <= 10) d = tripPrefixDep(t._foreignRouteTripId);
+  if (!d) return;
+  t.dep = d; t._depTripId = true;
+}
+// TGV from France: Paris–Genève (and the French part of Paris–Lausanne) is SNCF's run — its forecast comes from the SNCF trip
+// (via Transitous); the Swiss feeds do not know the French part and are ignored there (user, 23.11.2026). From Genève on
+// the Swiss data apply as before (trains that start in Switzerland are not touched at all).
+const SNCF_FEED = /fr-horaires-sncf/;
+const SNCF_RT_REASONS = new Set(['OBSERVED', 'PREDICTED', 'PROPAGATED']);
+const isSncfInbound = t => t.type === 'TGV' && isArrivingFromAbroad(t);
+function applySncfRule(t) {
+  if (!isSncfInbound(t)) return;
+  const key = trainTargetDateKeyScheduled(t), sn = t._sncf && t._sncf.key === key ? t._sncf : null;
+  if (sn && sn.delay !== null) {
+    if (t.status === 'cancelled') return;
+    t.delay = sn.delay; t.status = sn.delay > 4 ? 'delayed' : 'on-time';
+    t.delayKnown = true; t.delaySource = 'sncf'; t._confirmedDateKey = key; t._estFrom = null;
+  } else if (t.delayKnown && t.status !== 'cancelled' && t.delaySource !== 'sncf') {
+    t.delayKnown = false; t.delay = 0; t.status = 'on-time'; t.delaySource = null; // a Swiss figure for a French run: no figure at all
+  }
 }
 function resetStaleDayConfirmations() {
   for (const t of TRAINS) {
     adoptOwnTripDep(t);
+    applySncfRule(t);
     if (t.delayKnown && t._confirmedDateKey && t._confirmedDateKey !== trainTargetDateKeyScheduled(t)) {
       t.delayKnown = false; t.status = 'on-time'; t.delay = 0; t.liveSeen = false; t._cancelLock = null;
     }
@@ -1760,6 +1786,7 @@ const SWISS_ORIGIN_RE = /^(Zürich|Bern|Genève|Lausanne|Luzern|Chur|Interlaken|
 function depTrusted(t) {
   if (!t.dep) return false;
   if (t._depConfirmed || t._depTripId) return true;
+  if (t._id < 100000 && (t.chStation === 'Chiasso' || t.chStation === 'Domodossola')) return circDiff(toMin(t.dep), toMin(t.chTime)) < 600; // Italy axis: the curated slot time is a good guide (EC 22/24 are not "pünktlich" before they leave)
   if (t._id < 100000) return SWISS_ORIGIN_RE.test(cleanStationName(t.from)) && circDiff(toMin(t.dep), toMin(t.chTime)) < 600; // hand-entered: only a Swiss origin is certain (IC 281 "Stuttgart 18:05" was Singen's time)
   if (!t._originCH) return false;
   return circDiff(toMin(t.dep), toMin(t.chTime)) < 600 && resolveEff({chTime: t.dep, delay: 0}, nowMin()) <= resolveEff(t, nowMin()) + 5;
@@ -3035,7 +3062,7 @@ async function resolveDynamicRouteEndpoints(t) {
     // correct from an earlier lucky attempt, which made the (from!==trueFrom
     // || ...) part of the update check below never re-trigger further
     // retries, while dep quietly stayed on its original wrong fallback.
-    if (trueDep) live._depConfirmed = true;
+    if (trueDep && (live._id >= 100000 || samePlaceLoose(trueFrom, live.from))) live._depConfirmed = true;
     // curated Italy-axis row: only its departure time may be corrected, nothing else
     if (live._id < 100000 && (live.chStation === 'Chiasso' || live.chStation === 'Domodossola')) {
       if (refineCuratedItalyDep(live, trueFrom, trueDep)) applyFilters();
@@ -3582,6 +3609,21 @@ function hideDomodossolaConstructionGhosts() {
 function dedupeCuratedVsDynamic() {
   const curatedByKey = new Map(); // "type|number" -> curated train
   TRAINS.forEach(t => { if (t._id < 100000) curatedByKey.set(t.type + '|' + numKey(t.id), t); });
+  // A curated row's origin and departure are hand-entered guesses (EC 66 "Milano 17:25" while the Trenitalia trip leaves
+  // 18:05; EC 46 "Milano" while it starts in Venezia; TGV "Paris 17:05" vs SNCF 16:18). The live twin of the same run
+  // knows the real ones (trip id of its own/foreign trip) — hand them over, so the status can show the true departure
+  // instead of a guessed prognosis.
+  TRAINS.forEach(t => {
+    if (t._id < 100000) return;
+    const curated = curatedByKey.get(t.type + '|' + numKey(t.id));
+    if (!curated || curated._depTripId || !(t._occIso && isSameOccurrence(curated, t._occIso))) return;
+    adoptOwnTripDep(t);
+    if (!(t._depTripId || t._depConfirmed)) return;
+    if (samePlaceLoose(t.from, curated.from)) curated.dep = t.dep;
+    else if (t._foreignIT && (curated.chStation === 'Chiasso' || curated.chStation === 'Domodossola') && !/^(Domodossola|Chiasso)/i.test(t.from)) { curated.from = t.from; curated.dep = t.dep; }
+    else return;
+    curated._depTripId = true;
+  });
   TRAINS.forEach(t => {
     if (t._id < 100000 || t._hiddenDuplicate) return;
     const curated = curatedByKey.get(t.type + '|' + numKey(t.id));
@@ -4647,7 +4689,7 @@ async function verifyCancellationsAgainstChSource() {
 // real data from any other source always replaces it.
 const ESTIMATE_FEEDS = /hu-mav|sk-zsr|si-nap|at-Railway/;
 const REAL_RT_REASONS = new Set(['PREDICTED', 'PROPAGATED']);
-function carryForwardFromStops(stops, borderName) {
+function carryForwardFromStops(stops, borderName, reasons = REAL_RT_REASONS) {
   const delayOf = (actual, sched) => Math.round((new Date(actual) - new Date(sched)) / 60000);
   let ref = null;
   for (const s of stops) {
@@ -4655,7 +4697,7 @@ function carryForwardFromStops(stops, borderName) {
     const cands = [
       {actual: s.arrival, sched: s.scheduledArrival, reason: s.arrivalTimestampReason},
       {actual: s.departure, sched: s.scheduledDeparture, reason: s.departureTimestampReason},
-    ].filter(c => c.actual && c.sched && REAL_RT_REASONS.has(c.reason));
+    ].filter(c => c.actual && c.sched && reasons.has(c.reason));
     if (cands.length) {
       const c = cands[cands.length - 1];
       ref = {name: placeName(s), delay: delayOf(c.actual, c.sched), exact: !!atBorder};
@@ -4663,6 +4705,29 @@ function carryForwardFromStops(stops, borderName) {
     if (atBorder) break;
   }
   return ref;
+}
+async function enrichTgvFromSncf() {
+  if (Date.now() < rateLimitedUntil) return;
+  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && isSncfInbound(t) && inWindow(t)
+    && [t._foreignRouteTripId, t.tripId].some(id => SNCF_FEED.test(id || ''))
+    && Date.now() - (t._sncfAt || 0) > 2 * 60000).slice(0, 6);
+  if (!candidates.length) return;
+  let changed = false;
+  await Promise.all(candidates.map(async t => {
+    t._sncfAt = Date.now();
+    const id = [t._foreignRouteTripId, t.tripId].find(x => SNCF_FEED.test(x || ''));
+    let leg;
+    try {
+      const res = await fetchWithTimeout('https://api.transitous.org/api/v6/trip?tripId=' + encodeURIComponent(id), undefined, 9000);
+      if (!res.ok) return;
+      leg = (await res.json()).legs?.[0];
+    } catch (e) { return; }
+    if (!leg) return;
+    const ref = carryForwardFromStops([leg.from, ...(leg.intermediateStops || []), leg.to], t.chStation, SNCF_RT_REASONS); // SNCF also reports OBSERVED (train has passed)
+    t._sncf = {key: trainTargetDateKeyScheduled(t), delay: ref ? ref.delay : null};
+    changed = true;
+  }));
+  if (changed) applyFilters();
 }
 async function enrichFromTripCarryForward() {
   if (Date.now() < rateLimitedUntil) return;
@@ -5462,6 +5527,7 @@ async function pollOpendata() {
     verifyCancellationsAgainstChSource();
     enrichEcItalyRowsFromViaggiaTreno();
     enrichFromTripCarryForward();
+    enrichTgvFromSncf();
     enrichFromScotty();
     // The Zuglauf panel only ever fetches once, at the moment it's opened —
     // if a user leaves it open while the journey continues (confirmed live:
