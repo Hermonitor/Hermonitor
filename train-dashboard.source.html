@@ -1013,6 +1013,12 @@ const BASE_TRAINS = [
   {id:'ICE 276', from:'Brig',          to:'Frankfurt Hbf',  dep:'13:45', arr:'20:04', chTime:'16:23', chStation:'Basel Bad Bf', type:'ICE', region:'nord', operator:'DB/SBB'},
   {id:'ICE 100', from:'Interlaken Ost',to:'Hamburg Hbf',    dep:'16:59', arr:'01:09', chTime:'19:23', chStation:'Basel Bad Bf', type:'ICE', region:'nord', operator:'DB/SBB'},
   {id:'ICE 272', from:'Chur',          to:'Frankfurt Hbf',  dep:'17:38', arr:'23:04', chTime:'20:23', chStation:'Basel Bad Bf', type:'ICE', region:'nord', operator:'DB/SBB'},
+  // EuroCity-Express Basel SBB – Hamburg (DB, "ECE"; the Swiss feed shows only the 7-minute stub Basel SBB – Basel Bad Bf as "EC").
+  // Times from the DB trips 25.11.2026 (Sundays: via Hanau instead of Frankfurt, some end in Hannover). chTime = Basel Bad Bf.
+  {id:'EC 5',   from:'Hamburg Dammtor', to:'Basel SBB',     dep:'08:21', arr:'15:21', chTime:'15:01', chStation:'Basel Bad Bf', type:'EC', region:'nord', operator:'DB'},
+  {id:'EC 9',   from:'Hamburg Dammtor', to:'Basel SBB',     dep:'16:21', arr:'23:10', chTime:'23:01', chStation:'Basel Bad Bf', type:'EC', region:'nord', operator:'DB'},
+  {id:'EC 8',   from:'Basel SBB',       to:'Hamburg Hbf',   dep:'06:46', arr:'13:29', chTime:'06:53', chStation:'Basel Bad Bf', type:'EC', region:'nord', operator:'DB'},
+  {id:'EC 4',   from:'Basel SBB',       to:'Hamburg Hbf',   dep:'14:46', arr:'21:29', chTime:'14:53', chStation:'Basel Bad Bf', type:'EC', region:'nord', operator:'DB'},
 
   // ── REGION NORD: Via Basel SBB (TGV Lyria Zürich↔Paris) ─────────────────
 
@@ -1446,10 +1452,24 @@ function applySncfRule(t) {
     t.delayKnown = false; t.delay = 0; t.status = 'on-time'; t.delaySource = null; // a Swiss figure for a French run: no figure at all
   }
 }
+// Night trains through Germany (DB's DELFI feed carries ÖBB's Nightjet run): the forecast along the run is real up to a
+// point and then MOTIS flags the rest "INCONSISTENT_RT" while the stops after it fall back to the timetable (NJ 403,
+// 24.11.2026: +71 at Baden-Baden, then "+7" at Basel Bad Bf and "+0 PREDICTED" at Basel SBB — the train was +76). The
+// Swiss stub of the run has no forecast at all (NO_RT_DATA, shown as 0). When the border stop itself has no consistent
+// forecast, the last consistent one before it is carried forward (explicit estimate, "Hochrechnung ab ...") and wins over
+// the nominal figures of the later stops. Kept in t._njEst and applied on every render, so the next poll cannot undo it.
+function applyNjEstimate(t) {
+  if (t.type !== 'NJ' || !t._njEst || t.status === 'cancelled') return;
+  const key = trainTargetDateKeyScheduled(t);
+  if (t._njEst.key !== key || cancelLocked(t)) return;
+  t.delay = t._njEst.delay; t.status = t.delay > 4 ? 'delayed' : 'on-time';
+  t.delayKnown = true; t.delaySource = 'estimate'; t._estFrom = t._njEst.name; t._confirmedDateKey = key;
+}
 function resetStaleDayConfirmations() {
   for (const t of TRAINS) {
     adoptOwnTripDep(t);
     applySncfRule(t);
+    applyNjEstimate(t);
     if (t.delayKnown && t._confirmedDateKey && t._confirmedDateKey !== trainTargetDateKeyScheduled(t)) {
       t.delayKnown = false; t.status = 'on-time'; t.delay = 0; t.liveSeen = false; t._cancelLock = null;
     }
@@ -3357,7 +3377,8 @@ const BORDER_STATIONS = [
 // forecast for Feldkirch/Buchs while still in Hungary). Unmapped, those rows
 // were dropped and the only live source for inbound Austrian night trains
 // was never read.
-const CATEGORY_MAP = {ICE:'ICE', TGV:'TGV', EC:'EC', ECM:'EC', IC:'IC', RJ:'RJX', RJX:'RJX', NJ:'NJ', EN:'NJ', EURONIGHT:'NJ', XPRESS:'RJX', RE7:'RE7', TER:'TER'};
+// ECE = EuroCity-Express: DB labels EC 4/5/8/9 (Basel SBB – Hamburg) so; unmapped, those rows were dropped (23.11.2026)
+const CATEGORY_MAP = {ICE:'ICE', TGV:'TGV', EC:'EC', ECE:'EC', ECM:'EC', IC:'IC', RJ:'RJX', RJX:'RJX', NJ:'NJ', EN:'NJ', EURONIGHT:'NJ', XPRESS:'RJX', RE7:'RE7', TER:'TER'};
 
 // transitous.org watched long-distance/night-rail modes — excludes regional/
 // S-Bahn/suburban traffic so domestic short-hops never need to be fetched
@@ -4706,6 +4727,36 @@ function carryForwardFromStops(stops, borderName, reasons = REAL_RT_REASONS) {
   }
   return ref;
 }
+const NJ_TRIP_FEEDS = /de-DELFI|hu-mav|sk-zsr|si-nap|at-Railway/;
+async function enrichNjFromTrip() {
+  if (Date.now() < rateLimitedUntil) return;
+  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && inWindow(t) && t.status !== 'cancelled'
+    && [t._foreignRouteTripId, t.tripId].some(id => NJ_TRIP_FEEDS.test(id || ''))
+    && Date.now() - (t._njAt || 0) > 2 * 60000).slice(0, 6);
+  if (!candidates.length) return;
+  let changed = false;
+  await Promise.all(candidates.map(async t => {
+    t._njAt = Date.now();
+    const ids = [...new Set([t._foreignRouteTripId, t.tripId].filter(id => id && NJ_TRIP_FEEDS.test(id)))];
+    for (const id of ids) {
+      let leg;
+      try {
+        const res = await fetchWithTimeout('https://api.transitous.org/api/v6/trip?tripId=' + encodeURIComponent(id), undefined, 9000);
+        if (!res.ok) continue;
+        leg = (await res.json()).legs?.[0];
+      } catch (e) { continue; }
+      if (!leg) continue;
+      const ref = carryForwardFromStops([leg.from, ...(leg.intermediateStops || []), leg.to], t.chStation);
+      if (!ref) continue;
+      const key = trainTargetDateKeyScheduled(t), before = t._njEst && t._njEst.delay;
+      // consistent forecast at the border itself: the board reading is right, no override
+      t._njEst = ref.exact ? null : {key, delay: ref.delay, name: ref.name};
+      if ((t._njEst && t._njEst.delay) !== before) changed = true;
+      break;
+    }
+  }));
+  if (changed) applyFilters();
+}
 async function enrichTgvFromSncf() {
   if (Date.now() < rateLimitedUntil) return;
   const candidates = TRAINS.filter(t => !t._hiddenDuplicate && isSncfInbound(t) && inWindow(t)
@@ -5528,6 +5579,7 @@ async function pollOpendata() {
     enrichEcItalyRowsFromViaggiaTreno();
     enrichFromTripCarryForward();
     enrichTgvFromSncf();
+    enrichNjFromTrip();
     enrichFromScotty();
     // The Zuglauf panel only ever fetches once, at the moment it's opened —
     // if a user leaves it open while the journey continues (confirmed live:
