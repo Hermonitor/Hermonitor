@@ -4728,9 +4728,14 @@ function carryForwardFromStops(stops, borderName, reasons = REAL_RT_REASONS) {
   return ref;
 }
 const NJ_TRIP_FEEDS = /de-DELFI|hu-mav|sk-zsr|si-nap|at-Railway/;
+// A late night train must not fall out of this loop: without a delay its row is outside the time window as soon as the
+// scheduled time is 30 min past (NJ 403, 24.11.2026: the border entry said "+7, inconsistent", so nothing kept the row
+// in the window) — and without this lookup it never gets the delay that would bring it back. So: also trains seen live
+// today whose SCHEDULED time lies up to 6 h back.
+const njStillExpected = t => t.liveSeen && resolveEff({chTime: t.chTime, delay: 0}, nowMin()) >= nowMin() - 360;
 async function enrichNjFromTrip() {
   if (Date.now() < rateLimitedUntil) return;
-  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && inWindow(t) && t.status !== 'cancelled'
+  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && (inWindow(t) || njStillExpected(t)) && t.status !== 'cancelled'
     && [t._foreignRouteTripId, t.tripId].some(id => NJ_TRIP_FEEDS.test(id || ''))
     && Date.now() - (t._njAt || 0) > 2 * 60000).slice(0, 6);
   if (!candidates.length) return;
@@ -4746,7 +4751,8 @@ async function enrichNjFromTrip() {
         leg = (await res.json()).legs?.[0];
       } catch (e) { continue; }
       if (!leg) continue;
-      const ref = carryForwardFromStops([leg.from, ...(leg.intermediateStops || []), leg.to], t.chStation);
+      // OBSERVED counts too: once the train has really passed the border stop, that value replaces the estimate
+      const ref = carryForwardFromStops([leg.from, ...(leg.intermediateStops || []), leg.to], t.chStation, SNCF_RT_REASONS);
       if (!ref) continue;
       const key = trainTargetDateKeyScheduled(t), before = t._njEst && t._njEst.delay;
       // consistent forecast at the border itself: the board reading is right, no override
