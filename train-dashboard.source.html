@@ -813,8 +813,12 @@ async function fetchWithTimeout(url, options, timeoutMs = 3500, _retried = false
 // the ÖBB record of the very same train has no such stops and no cancellation. The whole night-train
 // roster showed up as (partly) "Ausfall" because of it (22.11.2026). For NJ a cancellation therefore
 // counts only when it comes from the operator's own record (ÖBB) or from SBB.
+// 25.11.2026: DB counts too. The night trains that come in through Germany (NJ 403 Amsterdam, 471 Hamburg, 458 Prag …) run on
+// DB's network, DB has the most current data even where ÖBB is the operator (user). What stays distrusted is the single stop
+// flag (see neutralizeStops / njRealCancellation), not the DB trip.
+const isDbAgency = a => /DB Fern|Deutsche Bahn/i.test(a || '');
 function trustsCancellation(type, agencyName) {
-  return type !== 'NJ' || /sterreichische|OEBB|ÖBB|Schweizerische|SBB/i.test(agencyName || '');
+  return type !== 'NJ' || /sterreichische|OEBB|ÖBB|Schweizerische|SBB/i.test(agencyName || '') || isDbAgency(agencyName);
 }
 // A stop where getting off (or on) is not allowed — the cabotage rule on NJ/EC between Zürich and
 // Basel SBB, "Aussteigen nicht gestattet" — comes out of MOTIS as cancelled:true on that stop's
@@ -832,7 +836,19 @@ function entryCancelled(type, e) {
 }
 function neutralizeStops(stops, type, agencyName) {
   const trusted = trustsCancellation(type, agencyName);
-  return stops.map(st => (st.cancelled && (!trusted || ignoresRestrictedStop(type, st))) ? {...st, cancelled: false} : st);
+  if (type === 'NJ') {
+    // cabotage stops (no alighting) come out as cancelled too, but isolated (1–2 stops); a real cancellation is a stretch of 3+
+    const keep = new Array(stops.length).fill(false);
+    for (let i = 0; i < stops.length;) {
+      if (!stops[i].cancelled) { i++; continue; }
+      let j = i;
+      while (j + 1 < stops.length && stops[j + 1].cancelled) j++;
+      if (trusted && j - i + 1 >= 3) for (let k = i; k <= j; k++) keep[k] = true;
+      i = j + 1;
+    }
+    return stops.map((st, i) => (st.cancelled && !keep[i]) ? {...st, cancelled: false} : st);
+  }
+  return stops.map(st => (st.cancelled && !trusted) ? {...st, cancelled: false} : st);
 }
 async function fetchJsonRetry(url, timeoutMs = 7000) {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -4802,6 +4818,7 @@ async function enrichNjFromTrip() {
   await Promise.all(candidates.map(async t => {
     t._njAt = Date.now();
     const ids = [...new Set([t._foreignRouteTripId, t.tripId].filter(id => id && NJ_TRIP_FEEDS.test(id)))];
+    let cxDone = false;
     for (const id of ids) {
       let leg;
       try {
@@ -4812,9 +4829,14 @@ async function enrichNjFromTrip() {
       if (!leg) continue;
       const rawStops = [leg.from, ...(leg.intermediateStops || []), leg.to];
       const key = trainTargetDateKeyScheduled(t);
-      // only the operator's own trip (ÖBB) / SBB may cancel a Nightjet; DB's codeshare copies flag unserved stops
-      if (trustsCancellation('NJ', leg.agencyName)) {
-        const real = njRealCancellation(rawStops, t.chStation, leg), was = !!(t._njCancel && t._njCancel.key === key);
+      // The first trip read decides (the row's preferred trip: the operator's own ÖBB trip when there is one).
+      // Operator/SBB trip: a run of >= 3 cancelled stops at the border. DB's codeshare copy, when it is the only trip there is
+      // (NJ 471, 25.11.2026 — no ÖBB variant in the feed): its single stop flags are unreliable (unserved stops), but the flag
+      // for the WHOLE trip (leg.cancelled) is not.
+      if (!cxDone) {
+        cxDone = true;
+        const real = trustsCancellation('NJ', leg.agencyName) ? njRealCancellation(rawStops, t.chStation, leg) : !!leg.cancelled;
+        const was = !!(t._njCancel && t._njCancel.key === key);
         if (real) { t._njCancel = {key}; setCancelLock(t); applyNjCancel(t); }
         else t._njCancel = null;
         if (real !== was) {
@@ -5224,7 +5246,10 @@ async function pollOpendata() {
           const stubZero = train._swissStubAtBorder && rowIsChFeed && delayMin <= 0 && !cancelled
             && Date.now() < new Date(scheduledIso).getTime();
           if (atOwnChStation) {
-            if (delayKnown && !stubZero && !cancelLocked(train)) {
+            // night trains: when DB's entry already gave the figure in this poll, the operator's copy does not overwrite it
+            const njDbWon = cls.type === 'NJ' && !isDbAgency(e.agencyName) && train._dbDelayPoll === pollsCompleted;
+            if (delayKnown && !stubZero && !cancelLocked(train) && !njDbWon) {
+              if (cls.type === 'NJ' && isDbAgency(e.agencyName)) train._dbDelayPoll = pollsCompleted;
               train.delay = delayMin; train.status = status; train.delayKnown = true; train.delaySource = 'transitous';
               // Which calendar day (Zurich) this confirmation is actually
               // FOR — a curated slot is a recurring daily schedule, so once
@@ -5295,7 +5320,10 @@ async function pollOpendata() {
             // own de-DELFI trip for the identical service lists the whole
             // route including Tuttlingen — and, in that specific case, is
             // exactly where the real cancellation boundary sits, not Singen.
-            if (newIsForeignFeed && rowIsInternational && !(train._foreignRouteTripId && !trustsCancellation(cls.type, e.agencyName))) train._foreignRouteTripId = e.tripId;
+            if (newIsForeignFeed && rowIsInternational && !(train._foreignRouteTripId && !trustsCancellation(cls.type, e.agencyName))
+              && !(cls.type === 'NJ' && train._foreignIsDb && !isDbAgency(e.agencyName))) {
+              train._foreignRouteTripId = e.tripId; train._foreignIsDb = isDbAgency(e.agencyName); // night trains: DB's trip stays the reference
+            }
           }
           // Curated (BASE_TRAINS) rows are never touched — their
           // timetabled from/to is authoritative regardless of what any live
@@ -5616,7 +5644,7 @@ async function pollOpendata() {
       // it (IC 1089: stuck on Singen's 16:32 until a later poll re-set it).
       if (t._routeFetchedForTrip !== t.tripId) {
         t._routeFetchedForTrip = t.tripId; t._routeFetchAttempts = 0; t._depConfirmed = false;
-        if (t._foreignRouteTripId && String(t._foreignRouteTripId).slice(0, 8) !== String(t.tripId).slice(0, 8)) t._foreignRouteTripId = null;
+        if (t._foreignRouteTripId && String(t._foreignRouteTripId).slice(0, 8) !== String(t.tripId).slice(0, 8)) { t._foreignRouteTripId = null; t._foreignIsDb = false; }
       }
       // Unconfirmed trains used to retry on EVERY poll forever — trains whose
       // route simply can't be extended (nothing adjoining exists) cost ~6
