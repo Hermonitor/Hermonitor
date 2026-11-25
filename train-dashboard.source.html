@@ -821,9 +821,18 @@ function trustsCancellation(type, agencyName) {
 // board row (NJ 409/459 at Basel SBB: cancelled=true, dropoffType NOT_ALLOWED). That is a restriction,
 // not a cancellation, and made NJ 459 "Ausfall".
 const isRestrictedStop = p => p?.dropoffType === 'NOT_ALLOWED' || p?.pickupType === 'NOT_ALLOWED';
+// ONLY for night trains (NJ). For every other train MOTIS gives a really cancelled stop dropoff/pickup NOT_ALLOWED as well
+// (ICE 379 / EC 9, 24.11.2026: Mannheim … Basel SBB all cancelled:true AND NOT_ALLOWED) — treating those as "restricted"
+// hid genuine cancellations behind a delay figure.
+const ignoresRestrictedStop = (type, p) => type === 'NJ' && isRestrictedStop(p);
+// Is this board entry a cancellation we believe? (shared by the poll and testable on its own)
+function entryCancelled(type, e) {
+  return trustsCancellation(type, e.agencyName)
+    && !!(e.tripCancelled || ((e.cancelled || e.place?.cancelled) && !ignoresRestrictedStop(type, e.place)));
+}
 function neutralizeStops(stops, type, agencyName) {
   const trusted = trustsCancellation(type, agencyName);
-  return stops.map(st => (st.cancelled && (!trusted || isRestrictedStop(st))) ? {...st, cancelled: false} : st);
+  return stops.map(st => (st.cancelled && (!trusted || ignoresRestrictedStop(type, st))) ? {...st, cancelled: false} : st);
 }
 async function fetchJsonRetry(url, timeoutMs = 7000) {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1465,9 +1474,28 @@ function applyNjEstimate(t) {
   t.delay = t._njEst.delay; t.status = t.delay > 4 ? 'delayed' : 'on-time';
   t.delayKnown = true; t.delaySource = 'estimate'; t._estFrom = t._njEst.name; t._confirmedDateKey = key;
 }
+// Night trains: a cancelled stop that is also "no boarding / no alighting" is ambiguous on the single board row — it is the
+// cabotage rule (one stop, e.g. Basel SBB) OR a real cancellation (MOTIS marks every cancelled stop that way). The operator's own
+// trip (ÖBB) tells them apart: a REAL cancellation takes a whole stretch of stops, the border stop being in a run of three or
+// more cancelled stops (NJ 403 / NJ 458, 25.11.2026: Bonn…Zürich and Frankfurt…Zürich). Kept in t._njCancel and applied on every
+// render; the cancel lock keeps the Swiss board (which still lists the train) from undoing it.
+function njRealCancellation(stops, border, leg) {
+  if (leg.cancelled) return true;
+  const i = stops.findIndex(s => samePlaceLoose(placeName(s), border));
+  if (i < 0 || !stops[i].cancelled) return false;
+  let a = i, b = i;
+  while (a > 0 && stops[a - 1].cancelled) a--;
+  while (b < stops.length - 1 && stops[b + 1].cancelled) b++;
+  return b - a + 1 >= 3;
+}
+function applyNjCancel(t) {
+  if (t.type !== 'NJ' || !t._njCancel || t._njCancel.key !== trainTargetDateKeyScheduled(t)) return;
+  t.status = 'cancelled'; t.delayKnown = true;
+}
 function resetStaleDayConfirmations() {
   for (const t of TRAINS) {
     adoptOwnTripDep(t);
+    applyNjCancel(t);
     applySncfRule(t);
     applyNjEstimate(t);
     if (t.delayKnown && t._confirmedDateKey && t._confirmedDateKey !== trainTargetDateKeyScheduled(t)) {
@@ -2876,6 +2904,26 @@ function deriveCancelledSegment(stops) {
   return {from: cleanStationName(stops[fromIdx].name), to: cleanStationName(stops[endIdx].name),
     full: stops.length > 1 && stops.every(s => !!s.cancelled)};
 }
+// A cancelled DB entry carries only the part that is STILL run: tripTo = last running stop (ICE 379 → "Frankfurt"), tripFrom =
+// first running stop (ICE 267 cancelled up to Karlsruhe → "Karlsruhe Hbf → München"). The trip itself lists every stop of the
+// timetable, cancelled ones included, so its ends are the timetabled route — which a cancelled row must show. One /trip
+// request per trip, using the foreign (DELFI) trip, because the Swiss feed's trip is only the stub at the border.
+async function correctCancelledRoute(t) {
+  const key = [t._foreignRouteTripId, t.tripId].filter(id => id && !/ch-opentransportdataswiss/.test(id))[0];
+  if (!key) { t._routeCorrectedFor = t.tripId; return; }
+  t._routeCorrectTries = (t._routeCorrectTries || 0) + 1;
+  const stops = await fetchTripLegStops(key, t.type);
+  const live = TRAINS.find(x => x._id === t._id);
+  if (live) live._routeCorrectInFlight = false;
+  if (!live || !stops || stops.length < 2) { if (live && live._routeCorrectTries >= 3) live._routeCorrectedFor = t.tripId; return; }
+  live._routeCorrectedFor = t.tripId;
+  const from = placeName(stops[0]), to = placeName(stops[stops.length - 1]);
+  if (live.status !== 'cancelled' || !from || !to || from === to || isNamelessHbf(from) || isNamelessHbf(to)) return;
+  live.from = from; live.to = to;
+  const dep = hhmmZurich(stops[0].scheduledDeparture);
+  if (dep) { live.dep = dep; live._depTripId = true; }
+  applyFilters();
+}
 async function resolveCancelledSegment(t) {
   // ONE /trip request, not the whole Zuglauf: fetchZuglaufStops also looks up every stop's live
   // reading and the adjoining trips (~20 requests per cancelled train, on every poll, up to 5
@@ -3314,7 +3362,7 @@ function buildZuglaufTable(stops) {
   // extension quirks, and the boundary it implied was too often wrong or
   // misleading in practice. The overview table's own JETZT marker is
   // unaffected — this only ever governed the Zuglauf's copy of it.
-  const rows = stops.map(s => {
+  const rows = stops.map((s, i) => {
     const name = cleanStationName(s.name);
     // A single shared `cancelled` flag on the stop conflates two genuinely
     // different situations: a stop the train never reaches at all (both An
@@ -3328,7 +3376,13 @@ function buildZuglaufTable(stops) {
     // arrival; Ab stays Ausfall whenever the stop is flagged cancelled,
     // since "arrives but doesn't continue" is exactly the terminating-early
     // case this is meant to show.
-    const cancelledArrival = s.cancelled && !s.arrival;
+    // The arrival stays only on the stop where the run ENDS (first cancelled stop, the next one cancelled too). Stops
+    // after it are never reached — their arrival is Ausfall as well, not the stale forecast MOTIS still carries
+    // (ICE 379: Karlsruhe … Basel SBB showed +13 … +4 next to "Ausfall"). Also a lone skipped stop (the train goes on)
+    // or a cancelled last stop has no arrival.
+    const prevCancelled = i > 0 && !!stops[i - 1].cancelled;
+    const nextCancelled = i + 1 < stops.length && !!stops[i + 1].cancelled;
+    const cancelledArrival = s.cancelled && (!s.arrival || prevCancelled || !nextCancelled);
     const anCell = buildZuglaufCell(s.scheduledArrival, s.arrival, cancelledArrival, !!s.forecast);
     const abCell = buildZuglaufCell(s.scheduledDeparture, s.departure, s.cancelled, !!s.forecast);
     // Flags the one specific case where a train restarts from a station it
@@ -3435,6 +3489,11 @@ function hhmmZurich(iso) {
 // (report of 02.11.). The stop's own id carries the municipality code
 // (de:08111 = Stuttgart), so the name can be recovered from it.
 const NAMELESS_HBF_BY_STOPID = [[/de:08111[:_]/, 'Stuttgart Hbf']];
+function timetabledHeadsign(e, tripToName) {
+  const hs = cleanStationName(String(e.headsign || '').replace(/\s*\(.*\)\s*$/, ''));
+  if (!hs || isNamelessHbf(hs) || hs === tripToName || hs === placeName(e.tripFrom)) return null;
+  return hs;
+}
 function placeName(place) {
   const n = cleanStationName(place?.name);
   if (!isNamelessHbf(n)) return n;
@@ -4735,7 +4794,7 @@ const NJ_TRIP_FEEDS = /de-DELFI|hu-mav|sk-zsr|si-nap|at-Railway/;
 const njStillExpected = t => t.liveSeen && resolveEff({chTime: t.chTime, delay: 0}, nowMin()) >= nowMin() - 360;
 async function enrichNjFromTrip() {
   if (Date.now() < rateLimitedUntil) return;
-  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && (inWindow(t) || njStillExpected(t)) && t.status !== 'cancelled'
+  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && (inWindow(t) || njStillExpected(t))
     && [t._foreignRouteTripId, t.tripId].some(id => NJ_TRIP_FEEDS.test(id || ''))
     && Date.now() - (t._njAt || 0) > 2 * 60000).slice(0, 6);
   if (!candidates.length) return;
@@ -4751,10 +4810,22 @@ async function enrichNjFromTrip() {
         leg = (await res.json()).legs?.[0];
       } catch (e) { continue; }
       if (!leg) continue;
+      const rawStops = [leg.from, ...(leg.intermediateStops || []), leg.to];
+      const key = trainTargetDateKeyScheduled(t);
+      // only the operator's own trip (ÖBB) / SBB may cancel a Nightjet; DB's codeshare copies flag unserved stops
+      if (trustsCancellation('NJ', leg.agencyName)) {
+        const real = njRealCancellation(rawStops, t.chStation, leg), was = !!(t._njCancel && t._njCancel.key === key);
+        if (real) { t._njCancel = {key}; setCancelLock(t); applyNjCancel(t); }
+        else t._njCancel = null;
+        if (real !== was) {
+          if (!real && t.status === 'cancelled') { t.status = 'on-time'; t.delayKnown = false; t.delay = 0; } // was cancelled by this rule, not any more
+          changed = true;
+        }
+      }
       // OBSERVED counts too: once the train has really passed the border stop, that value replaces the estimate
-      const ref = carryForwardFromStops([leg.from, ...(leg.intermediateStops || []), leg.to], t.chStation, SNCF_RT_REASONS);
+      const ref = carryForwardFromStops(rawStops, t.chStation, SNCF_RT_REASONS);
       if (!ref) continue;
-      const key = trainTargetDateKeyScheduled(t), before = t._njEst && t._njEst.delay;
+      const before = t._njEst && t._njEst.delay;
       // consistent forecast at the border itself: the board reading is right, no override
       t._njEst = ref.exact ? null : {key, delay: ref.delay, name: ref.name};
       if ((t._njEst && t._njEst.delay) !== before) changed = true;
@@ -5058,8 +5129,7 @@ async function pollOpendata() {
         // train +10' as «Pünktlich» (SBB's row said +0) — reports of 26.10.
         // (96207 / 96209). The Swiss TER row still proves the train exists.
         const statusBlind = cls.type === 'TER' && /ch-opentransportdataswiss/.test(e.tripId || '');
-        const cancelled = !statusBlind && trustsCancellation(cls.type, e.agencyName)
-          && !!(e.tripCancelled || ((e.cancelled || e.place?.cancelled) && !isRestrictedStop(e.place)));
+        const cancelled = !statusBlind && entryCancelled(cls.type, e);
         const hasLiveDelay = !statusBlind && e.realTime === true;
         const delayMin = (hasLiveDelay && scheduledIso && actualIso)
           ? Math.round((new Date(actualIso) - new Date(scheduledIso)) / 60000) : 0;
@@ -5280,7 +5350,11 @@ async function pollOpendata() {
         // destination for this specific feed row — see the farthest-
         // endpoint comment above for why duplicates get compared, not just
         // first-wins deduped.
-        const from = placeName(e.tripFrom), to = placeName(e.tripTo);
+        // A cancelled DB entry reports tripTo = the last stop that is STILL run (ICE 379 cancelled from Frankfurt: tripTo
+        // "Frankfurt (Main) Hbf", ECE 9: "Karlsruhe Hbf"), while its headsign keeps the timetabled destination ("Basel SBB").
+        // A cancelled row must keep the timetabled route, so the headsign wins there (24.11.2026).
+        const from = placeName(e.tripFrom);
+        const to = (cancelled && timetabledHeadsign(e, placeName(e.tripTo))) || placeName(e.tripTo);
         if (!from || !to || from === to || isNamelessHbf(from) || isNamelessHbf(to)) return;
         // Purely domestic runs (both ends in Switzerland) share our watched
         // categories too (e.g. an IC that never leaves CH, or an RE7/TER
@@ -5435,6 +5509,10 @@ async function pollOpendata() {
     // dozens of per-stop requests), part of the request flood that got
     // Transitous/opendata.ch answering 429 to the whole office.
     TRAINS.forEach(t => {
+      if (t.status === 'cancelled' && t._id >= 100000 && t.tripId && !t._hiddenDuplicate && inWindow(t) && t._routeCorrectedFor !== t.tripId && !t._routeCorrectInFlight) {
+        t._routeCorrectInFlight = true;
+        correctCancelledRoute(t);
+      }
       if (t.status === 'cancelled' && t.tripId && !t._hiddenDuplicate && inWindow(t) && t._segmentFetchedFor !== t.tripId && !t._segmentFetchInFlight) {
         t._segmentFetchInFlight = true;
         resolveCancelledSegment(t);
