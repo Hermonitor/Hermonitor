@@ -625,7 +625,7 @@
         <div class="guide-source-card">
           <a class="src-name" href="https://fahrplan.oebb.at/bin/trainsearch.exe/dn?protocol=https:&" target="_blank" rel="noopener">ÖBB-Fahrplanauskunft (Scotty) ↗</a>
           <span class="src-role">Österreichisches Netz</span>
-          <p>Die Prognosen der ÖBB, über einen eigenen kleinen Zwischenserver abgefragt (sparsam, Antworten werden zwischengespeichert). Liefert Verspätung und Ausfall für die Züge von/nach Österreich via Buchs SG, für die in den anderen Quellen keine Echtzeitdaten vorliegen.</p>
+          <p>Die Prognosen der ÖBB, über einen eigenen kleinen Zwischenserver abgefragt (sparsam, Antworten werden zwischengespeichert). Liefert Verspätung und Ausfall für alle Züge ab Österreich via Buchs SG: für diese Züge gelten ausschliesslich die ÖBB-Daten, Transitous und die Schweizer Quellen werden dort nicht verwendet. Für Züge von der Schweiz nach Österreich nur, wenn die anderen Quellen keine Echtzeitdaten haben.</p>
         </div>
       </div>
     </section>
@@ -669,7 +669,7 @@
 // aktuellen Hinweise" line instead of an empty list.
 const CURRENT_NOTICES = [
   'Bei Ausfällen wird nur «Ausfall» angezeigt. Welche Strecke betroffen ist, bitte über «Prüfen» nachschlagen.',
-  'Für RJX/EC/NJ ab Österreich wird zusätzlich die ÖBB-Fahrplanauskunft abgefragt. Fehlt dort noch die Prognose (z. B. vor Fahrtbeginn), wird die letzte bekannte Verspätung als «Hochrechnung» angezeigt, sonst «Keine Daten vorhanden».',
+  'Für Züge ab Österreich (via Buchs SG) gelten ausschliesslich die Daten der ÖBB-Fahrplanauskunft. Fehlt dort die Prognose (z. B. vor Fahrtbeginn), steht die Abfahrtszeit bzw. «Keine Daten vorhanden».',
 ];
 // A connectivity blip against opendata.ch/Transitous doesn't just fail one
 // request — it fails EVERY request in flight at that moment, and the
@@ -794,7 +794,8 @@ async function fetchWithTimeout(url, options, timeoutMs = 3500, _retried = false
     if (viaTransitous && res.ok) transitousFailStreak = 0;
     return res;
   } catch (e) {
-    if (viaTransitous && !controller.signal.aborted && ++transitousFailStreak >= 3) transitousPauseUntil = Date.now() + 3600000;
+    // via our proxy a failed request is a connection hiccup, not a Transitous block (that comes back as 503/403): 3 min, not an hour
+    if (viaTransitous && !controller.signal.aborted && ++transitousFailStreak >= 3) transitousPauseUntil = Date.now() + (TRANSITOUS_PROXY_BASE ? 180000 : 3600000);
     if (_retried || controller.signal.aborted || (viaTransitous && Date.now() < transitousPauseUntil)) throw e; // don't retry a genuine timeout — that's not a blip
     await new Promise(r => setTimeout(r, 300));
     return await fetchWithTimeout(url, options, timeoutMs, true);
@@ -1469,6 +1470,12 @@ const isSncfInbound = t => t.type === 'TGV' && isArrivingFromAbroad(t);
 function applySncfRule(t) {
   if (!isSncfInbound(t)) return;
   const key = trainTargetDateKeyScheduled(t), sn = t._sncf && t._sncf.key === key ? t._sncf : null;
+  // Cancelled from Bellegarde on (TGV 9765, 25.11.2026): the SNCF trip flags Bellegarde…Genève cancelled while the stops before
+  // still carry their ~20 min delay — that delay was shown instead of "Ausfall". The border stop in the SNCF trip decides.
+  if (sn && sn.cancelled) {
+    t.status = 'cancelled'; t.delayKnown = true; t._confirmedDateKey = key; setCancelLock(t);
+    return;
+  }
   if (sn && sn.delay !== null) {
     if (t.status === 'cancelled') return;
     t.delay = sn.delay; t.status = sn.delay > 4 ? 'delayed' : 'on-time';
@@ -1484,7 +1491,7 @@ function applySncfRule(t) {
 // forecast, the last consistent one before it is carried forward (explicit estimate, "Hochrechnung ab ...") and wins over
 // the nominal figures of the later stops. Kept in t._njEst and applied on every render, so the next poll cannot undo it.
 function applyNjEstimate(t) {
-  if (t.type !== 'NJ' || !t._njEst || t.status === 'cancelled') return;
+  if (t.type !== 'NJ' || isScottyTrain(t) || !t._njEst || t.status === 'cancelled') return;
   const key = trainTargetDateKeyScheduled(t);
   if (t._njEst.key !== key || cancelLocked(t)) return;
   t.delay = t._njEst.delay; t.status = t.delay > 4 ? 'delayed' : 'on-time';
@@ -1505,12 +1512,32 @@ function njRealCancellation(stops, border, leg) {
   return b - a + 1 >= 3;
 }
 function applyNjCancel(t) {
-  if (t.type !== 'NJ' || !t._njCancel || t._njCancel.key !== trainTargetDateKeyScheduled(t)) return;
+  if (t.type !== 'NJ' || isScottyTrain(t) || !t._njCancel || t._njCancel.key !== trainTargetDateKeyScheduled(t)) return;
   t.status = 'cancelled'; t.delayKnown = true;
+}
+// Trains from Austria (arriving at Buchs SG) are read from ÖBB's own timetable (Scotty, via our proxy) and NOT from Transitous or
+// the Swiss feeds (user, 26.11.2026). Whatever those sources put on the row — delay, estimate, cancellation — is taken off
+// again here; only the Scotty figure (kept in t._scotty by enrichFromScotty) shows. No Scotty figure = no figure.
+// "From Austria" = the run does not start on Swiss soil. The Swiss feed's stub rows are named after the border ("Kufstein → Buchs
+// Bahnhof", outbound "Buchs Bahnhof → Kufstein"), so isArrivingFromAbroad (needs a Swiss destination) misses nearly all of them.
+const swissOrigin = n => isSwissCity(n) || /^(Buchs|Sargans|Chur|Zürich)\b/i.test(cleanStationName(n) || '');
+const isScottyTrain = t => !!SCOTTY_PROXY_BASE && t.chStation === 'Buchs SG' && !swissOrigin(t.from);
+function applyScottyRule(t) {
+  if (!isScottyTrain(t)) return;
+  const key = trainTargetDateKeyScheduled(t), sc = t._scotty && t._scotty.key === key ? t._scotty : null;
+  if (sc && sc.cancelled) { t.status = 'cancelled'; t.delayKnown = true; t._confirmedDateKey = key; return; }
+  if (sc && sc.delay !== null) {
+    t.delay = sc.delay; t.status = sc.delay > 4 ? 'delayed' : 'on-time';
+    t.delayKnown = true; t.delaySource = 'scotty'; t._confirmedDateKey = key; t._estFrom = null;
+    return;
+  }
+  if (t.delayKnown && t.delaySource !== 'scotty') { t.delayKnown = false; t.delay = 0; t.delaySource = null; t._estFrom = null; if (!cancelLocked(t)) t.status = 'on-time'; }
+  else if (t.status === 'cancelled' && !cancelLocked(t)) t.status = 'on-time';
 }
 function resetStaleDayConfirmations() {
   for (const t of TRAINS) {
     adoptOwnTripDep(t);
+    applyScottyRule(t);
     applyNjCancel(t);
     applySncfRule(t);
     applyNjEstimate(t);
@@ -4810,7 +4837,7 @@ const NJ_TRIP_FEEDS = /de-DELFI|hu-mav|sk-zsr|si-nap|at-Railway/;
 const njStillExpected = t => t.liveSeen && resolveEff({chTime: t.chTime, delay: 0}, nowMin()) >= nowMin() - 360;
 async function enrichNjFromTrip() {
   if (Date.now() < rateLimitedUntil) return;
-  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && (inWindow(t) || njStillExpected(t))
+  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.type === 'NJ' && !isScottyTrain(t) && (inWindow(t) || njStillExpected(t))
     && [t._foreignRouteTripId, t.tripId].some(id => NJ_TRIP_FEEDS.test(id || ''))
     && Date.now() - (t._njAt || 0) > 2 * 60000).slice(0, 6);
   if (!candidates.length) return;
@@ -4874,14 +4901,17 @@ async function enrichTgvFromSncf() {
     } catch (e) { return; }
     if (!leg) return;
     const ref = carryForwardFromStops([leg.from, ...(leg.intermediateStops || []), leg.to], t.chStation, SNCF_RT_REASONS); // SNCF also reports OBSERVED (train has passed)
-    t._sncf = {key: trainTargetDateKeyScheduled(t), delay: ref ? ref.delay : null};
+        const stops = [leg.from, ...(leg.intermediateStops || []), leg.to], bi = stops.findIndex(s => samePlaceLoose(placeName(s), t.chStation));
+    const cancelled = !!leg.cancelled || (bi >= 0 && !!stops[bi].cancelled);
+    if (!cancelled && t._sncf && t._sncf.cancelled && t.status === 'cancelled') { t._cancelLock = null; t.status = 'on-time'; t.delayKnown = false; t.delay = 0; } // lifted again
+    t._sncf = {key: trainTargetDateKeyScheduled(t), delay: ref ? ref.delay : null, cancelled};
     changed = true;
   }));
   if (changed) applyFilters();
 }
 async function enrichFromTripCarryForward() {
   if (Date.now() < rateLimitedUntil) return;
-  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && inWindow(t)
+  const candidates = TRAINS.filter(t => !t._hiddenDuplicate && inWindow(t) && !isScottyTrain(t)
     && (!t.delayKnown || t.delaySource === 'estimate')
     && Date.now() - (t._estAt || 0) > 3 * 60000
     && [t._foreignRouteTripId, t.tripId].some(id => ESTIMATE_FEEDS.test(id || '')))
@@ -4929,7 +4959,7 @@ async function enrichFromScotty() {
   if (!SCOTTY_PROXY_BASE || Date.now() < scottyBackoffUntil) return;
   const now = nowMin();
   const candidates = TRAINS.filter(t => !t._hiddenDuplicate && t.chStation === 'Buchs SG' && inWindow(t)
-    && (!t.delayKnown || t.delaySource === 'estimate' || t.delaySource === 'oebb' || t.delaySource === 'scotty')
+    && (isScottyTrain(t) || !t.delayKnown || t.delaySource === 'estimate' || t.delaySource === 'oebb' || t.delaySource === 'scotty')
     // window: runs passing Buchs within the next 6 h (ÖBB often already has a
     // forecast for a train that is under way); a run without any forecast yet and
     // still more than 90 min away is only re-asked every 10 minutes
@@ -4954,7 +4984,7 @@ async function enrichFromScotty() {
     } catch (e) {
       // not deployed / blocked / ÖBB unreachable: stay silent and back off
       scottyFailStreak++;
-      scottyBackoffUntil = Date.now() + (scottyFailStreak >= 3 ? 30 : 5) * 60000;
+      scottyBackoffUntil = Date.now() + Math.min(scottyFailStreak, 3) * 60000; // 1–3 min; was 5 / 30 min: one slow ÖBB answer silenced every ÖBB-only train for up to half an hour
       return;
     }
     if (!body.found) { t._scottyMiss = (t._scottyMiss || 0) + 1; return; }
@@ -4968,6 +4998,7 @@ async function enrichFromScotty() {
     // absolute time, the proxy reports how far its "Soll" lies from OUR timetable (shiftMin)
     const d = typeof d0 === 'number' ? d0 + (body.shiftMin || 0) : d0;
     t._rerouted = !!body.rerouted;
+    t._scotty = {key: trainTargetDateKeyScheduled(t), delay: (!stop.cancelled && typeof d === 'number') ? d : null, cancelled: !!stop.cancelled};
     if (stop.cancelled) {
       t.status = 'cancelled'; t.delay = 0;
     } else if (typeof d === 'number') {
