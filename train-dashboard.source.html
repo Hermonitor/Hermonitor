@@ -3754,6 +3754,8 @@ function dedupeCuratedVsDynamic() {
     // the live trip is what the Zuglauf needs — hand it over even while no delay is known yet
     // (it used to arrive only together with a delay/cancellation, i.e. with the false "Ausfall")
     if (!curated.tripId && t.tripId) { curated.tripId = t.tripId; curated._foreignRouteTripId = curated._foreignRouteTripId || t._foreignRouteTripId; }
+    const twinForeign = t._foreignRouteTripId || (t.tripId && !/ch-opentransportdataswiss/.test(t.tripId) ? t.tripId : null);
+    if (twinForeign && !curated._foreignRouteTripId) { curated._foreignRouteTripId = twinForeign; curated._foreignIsDb = !!t._foreignIsDb || (t.type === 'NJ' && /de-DELFI/.test(twinForeign)); }
     if (t.delayKnown && !curated.delayKnown) {
       curated.delay = t.delay; curated.status = t.status; curated.delayKnown = true;
       markLiveSeen(curated); curated.tripId = t.tripId;
@@ -5204,8 +5206,8 @@ async function pollOpendata() {
         // EC 42/44/41 ×6 after ten minutes).
         let train = TRAINS.find(t => t.type === cls.type
           && (numKey(t.id) === nk || (t._aliasNumbers && t._aliasNumbers.includes(nk)))
-          && (circDiff(toMin(chTime), t._schedMin) <= 15
-            || (t._altSchedMins && t._altSchedMins.some(m => circDiff(toMin(chTime), m) <= 15))));
+          && (circDiff(toMin(chTime), t._schedMin) <= (cls.type === 'NJ' ? 60 : 15)
+            || (t._altSchedMins && t._altSchedMins.some(m => circDiff(toMin(chTime), m) <= (cls.type === 'NJ' ? 60 : 15)))));
 
         // A feed can report the same physical run with a truncated
         // endpoint (a nearby intermediate stop) alongside a fuller one from
@@ -5293,7 +5295,9 @@ async function pollOpendata() {
               // long it takes a fresh poll to reach that far ahead.
               train._confirmedDateKey = zurichDateKey(new Date(scheduledIso));
             }
-            train.chTime = chTime; // keep in sync with actual live schedule/track
+            // night trains: DB's schedule time wins over the Swiss stub's (which can still carry the old timetable)
+            if (cls.type !== 'NJ' || isDbAgency(e.agencyName) || !train._chTimeDb) train.chTime = chTime; // keep in sync with actual live schedule/track
+            if (cls.type === 'NJ' && isDbAgency(e.agencyName)) train._chTimeDb = true;
             // Same border stop can legitimately be reported by BOTH the
             // Swiss feed and a foreign (e.g. DB DELFI) feed in one poll —
             // whichever happened to be processed last used to just win.
